@@ -43,13 +43,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ([string]::IsNullOrWhiteSpace($env:PAYLOAD_KEY_B64)) { throw 'payload key missing' }
 
-          $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath 'wpf-payload-cipher.b64' -Raw).Trim())
+          $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath 'wpf-payload-v2-cipher.b64' -Raw).Trim())
           $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
-          $expectedCipherHash = (Get-Content -LiteralPath 'payload.cipher.sha256' -Raw).Trim().ToLowerInvariant()
+          $expectedCipherHash = (Get-Content -LiteralPath 'payload-v2.cipher.sha256' -Raw).Trim().ToLowerInvariant()
           if ($cipherHash -ne $expectedCipherHash) { throw "cipher hash mismatch: $cipherHash" }
 
           $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
-          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath 'payload.iv.b64' -Raw).Trim())
+          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath 'payload-v2.iv.b64' -Raw).Trim())
           $aes = [Security.Cryptography.Aes]::Create()
           try {
             $aes.Mode = [Security.Cryptography.CipherMode]::CBC
@@ -67,7 +67,7 @@ jobs:
           }
 
           $plainHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant()
-          $expectedPlainHash = (Get-Content -LiteralPath 'payload.plain.sha256' -Raw).Trim().ToLowerInvariant()
+          $expectedPlainHash = (Get-Content -LiteralPath 'payload-v2.plain.sha256' -Raw).Trim().ToLowerInvariant()
           if ($plainHash -ne $expectedPlainHash) { throw "plain hash mismatch: $plainHash" }
 
           $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-private'
@@ -78,7 +78,7 @@ jobs:
           Expand-Archive -LiteralPath $zipPath -DestinationPath $privateRoot -Force
           Remove-Item -LiteralPath $zipPath -Force
 
-          $payloadRoot = Join-Path $privateRoot 'wpf-cleanroom-payload'
+          $payloadRoot = Join-Path $privateRoot 'wpf-cleanroom-payload-v2'
           if (-not (Test-Path -LiteralPath (Join-Path $payloadRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'payload root missing' }
           @(
             "CIPHER_SHA256=$cipherHash"
@@ -100,9 +100,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $script)) { throw "runner script missing: $script" }
 
           $expectedScriptHash = if ($env:TARGET -eq 'net10') {
-            'e6685157cc12c67cdf8ac8fa8bffece3f74d18139da1caa54b0f7470495e4583'
+            '320afad1cc41781cb987e74156926b980e89e48701d192fce3053a3f14603135'
           } else {
-            '158ff95b22b12712c9ed56342c5bb20940b107a205a8449b1c0bf32fe28f13a5'
+            '893451c550945416aee360a74ce591e6af3b08cb5283c747181723eb43f2c903'
           }
           $scriptHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $script).Hash.ToLowerInvariant()
           if ($scriptHash -ne $expectedScriptHash) { throw "runner script hash mismatch: $scriptHash" }
