@@ -43,13 +43,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ([string]::IsNullOrWhiteSpace($env:PAYLOAD_KEY_B64)) { throw 'payload key missing' }
 
-          $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath 'wpf-payload-v2-cipher.b64' -Raw).Trim())
+          $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath 'wpf-payload-v3-cipher.b64' -Raw).Trim())
           $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
-          $expectedCipherHash = (Get-Content -LiteralPath 'payload-v2.cipher.sha256' -Raw).Trim().ToLowerInvariant()
+          $expectedCipherHash = (Get-Content -LiteralPath 'payload-v3.cipher.sha256' -Raw).Trim().ToLowerInvariant()
           if ($cipherHash -ne $expectedCipherHash) { throw "cipher hash mismatch: $cipherHash" }
 
           $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
-          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath 'payload-v2.iv.b64' -Raw).Trim())
+          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath 'payload-v3.iv.b64' -Raw).Trim())
           $aes = [Security.Cryptography.Aes]::Create()
           try {
             $aes.Mode = [Security.Cryptography.CipherMode]::CBC
@@ -67,7 +67,7 @@ jobs:
           }
 
           $plainHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant()
-          $expectedPlainHash = (Get-Content -LiteralPath 'payload-v2.plain.sha256' -Raw).Trim().ToLowerInvariant()
+          $expectedPlainHash = (Get-Content -LiteralPath 'payload-v3.plain.sha256' -Raw).Trim().ToLowerInvariant()
           if ($plainHash -ne $expectedPlainHash) { throw "plain hash mismatch: $plainHash" }
 
           $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-private'
@@ -100,9 +100,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $script)) { throw "runner script missing: $script" }
 
           $expectedScriptHash = if ($env:TARGET -eq 'net10') {
-            '320afad1cc41781cb987e74156926b980e89e48701d192fce3053a3f14603135'
+            '60463a2225c83546ff52f48dd1e0b2fbe6af95a791a40a34ffeb5357e5c37c6a'
           } else {
-            '893451c550945416aee360a74ce591e6af3b08cb5283c747181723eb43f2c903'
+            '955b931501aa79a8accaa7a5f386fbb20be73e0ce12e5b7f0d37674c54c01d9c'
           }
           $scriptHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $script).Hash.ToLowerInvariant()
           if ($scriptHash -ne $expectedScriptHash) { throw "runner script hash mismatch: $scriptHash" }
