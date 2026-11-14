@@ -108,17 +108,30 @@ jobs:
           if (-not (Test-Path -LiteralPath (Join-Path $mainRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'main payload root missing' }
           if (-not (Test-Path -LiteralPath (Join-Path $integrityRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'integrity payload root missing' }
 
-          foreach ($payloadRoot in @($mainRoot,$integrityRoot)) {
-            $manifestPath = Join-Path $payloadRoot 'MANIFEST.json'
-            if (-not (Test-Path -LiteralPath $manifestPath)) { throw "manifest missing: $manifestPath" }
-            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-            foreach ($entry in $manifest.files) {
-              $path = Join-Path $payloadRoot ([string]$entry.path)
-              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "manifest file missing: $path" }
-              $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-              if ($hash -ne [string]$entry.sha256 -or (Get-Item -LiteralPath $path).Length -ne [int64]$entry.bytes) {
-                throw "manifest mismatch: $path"
-              }
+          $mainProvenancePath = Join-Path $mainRoot 'PAYLOAD_PROVENANCE.json'
+          $mainProvenance = Get-Content -LiteralPath $mainProvenancePath -Raw | ConvertFrom-Json
+          if ([string]$mainProvenance.source_commit -ne 'e36968255a9bfbf9507ebd3b7e5224d7901f9fb8' -or
+              [string]$mainProvenance.source_archive_sha256 -ne '97d9d41b2c85ff20ef903d8590e258b1511674c0eb4bd360311e734ce7d1a3f5' -or
+              [string]$mainProvenance.wrapper_generation -ne 'v3-runtimeconfig-property-safe') {
+            throw 'main payload provenance mismatch'
+          }
+          foreach ($entry in $mainProvenance.files) {
+            $path = Join-Path $mainRoot ([string]$entry.path)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "main provenance file missing: $path" }
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne [string]$entry.sha256 -or (Get-Item -LiteralPath $path).Length -ne [int64]$entry.bytes) {
+              throw "main provenance mismatch: $path"
+            }
+          }
+
+          $integrityManifestPath = Join-Path $integrityRoot 'MANIFEST.json'
+          $integrityManifest = Get-Content -LiteralPath $integrityManifestPath -Raw | ConvertFrom-Json
+          foreach ($entry in $integrityManifest.files) {
+            $path = Join-Path $integrityRoot ([string]$entry.path)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "integrity manifest file missing: $path" }
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne [string]$entry.sha256 -or (Get-Item -LiteralPath $path).Length -ne [int64]$entry.bytes) {
+              throw "integrity manifest mismatch: $path"
             }
           }
 
