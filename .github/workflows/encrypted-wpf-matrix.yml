@@ -1,0 +1,246 @@
+name: Encrypted WPF Current-Release Matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - target: net10
+            sdk: 10.0.404
+            repeat: 1
+          - target: net10
+            sdk: 10.0.404
+            repeat: 2
+          - target: net10
+            sdk: 10.0.404
+            repeat: 3
+          - target: net11
+            sdk: 11.0.100
+            repeat: 1
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Decrypt and verify private WPF payload
+        shell: pwsh
+        env:
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:PAYLOAD_KEY_B64)) { throw 'payload key missing' }
+
+          $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath 'wpf-payload-cipher.b64' -Raw).Trim())
+          $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
+          $expectedCipherHash = (Get-Content -LiteralPath 'payload.cipher.sha256' -Raw).Trim().ToLowerInvariant()
+          if ($cipherHash -ne $expectedCipherHash) { throw "cipher hash mismatch: $cipherHash" }
+
+          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
+          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath 'payload.iv.b64' -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.IV = $iv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $plain = $decryptor.TransformFinalBlock($cipher, 0, $cipher.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $plainHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant()
+          $expectedPlainHash = (Get-Content -LiteralPath 'payload.plain.sha256' -Raw).Trim().ToLowerInvariant()
+          if ($plainHash -ne $expectedPlainHash) { throw "plain hash mismatch: $plainHash" }
+
+          $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-private'
+          $zipPath = Join-Path $env:RUNNER_TEMP 'wpf-private.zip'
+          Remove-Item -LiteralPath $privateRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $privateRoot | Out-Null
+          [IO.File]::WriteAllBytes($zipPath, $plain)
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $privateRoot -Force
+          Remove-Item -LiteralPath $zipPath -Force
+
+          $payloadRoot = Join-Path $privateRoot 'wpf-cleanroom-payload'
+          if (-not (Test-Path -LiteralPath (Join-Path $payloadRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'payload root missing' }
+          @(
+            "CIPHER_SHA256=$cipherHash"
+            "PLAIN_SHA256=$plainHash"
+            "PAYLOAD_ROOT=$payloadRoot"
+          ) | Set-Content (Join-Path $env:RUNNER_TEMP 'wpf-payload-integrity.txt')
+
+      - name: Execute exact-target WPF validation
+        id: execute
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          REPEAT_ID: ${{ matrix.repeat }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payloadRoot = Join-Path $env:RUNNER_TEMP 'wpf-private\wpf-cleanroom-payload'
+          $privateRepo = Join-Path $payloadRoot 'repo'
+          $script = Join-Path $payloadRoot "run-$env:TARGET.ps1"
+          if (-not (Test-Path -LiteralPath $script)) { throw "runner script missing: $script" }
+
+          $expectedScriptHash = if ($env:TARGET -eq 'net10') {
+            'e6685157cc12c67cdf8ac8fa8bffece3f74d18139da1caa54b0f7470495e4583'
+          } else {
+            '158ff95b22b12712c9ed56342c5bb20940b107a205a8449b1c0bf32fe28f13a5'
+          }
+          $scriptHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $script).Hash.ToLowerInvariant()
+          if ($scriptHash -ne $expectedScriptHash) { throw "runner script hash mismatch: $scriptHash" }
+
+          $tokens = $null
+          $errors = $null
+          [Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | Format-List * | Out-String | Write-Error
+            throw "runner script parse failed: $($errors.Count) errors"
+          }
+
+          $env:GITHUB_WORKSPACE = $privateRepo
+          $env:GITHUB_ENV = Join-Path $env:RUNNER_TEMP "wpf-env-$env:TARGET-r$env:REPEAT_ID.txt"
+          $env:WPF_REPEAT_ID = $env:REPEAT_ID
+          New-Item -ItemType File -Force -Path $env:GITHUB_ENV | Out-Null
+
+          $stdout = Join-Path $env:RUNNER_TEMP "wpf-$env:TARGET-r$env:REPEAT_ID.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "wpf-$env:TARGET-r$env:REPEAT_ID.stderr.log"
+          $process = Start-Process -FilePath pwsh.exe -ArgumentList @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$script
+          ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          "WPF_SCRIPT_EXIT_CODE=$($process.ExitCode)" | Set-Content (Join-Path $env:RUNNER_TEMP "wpf-$env:TARGET-r$env:REPEAT_ID.exit.txt")
+          if ($process.ExitCode -ne 0) { throw "WPF validation failed: $($process.ExitCode)" }
+
+      - name: Stage private evidence
+        if: always()
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          SDK_VERSION: ${{ matrix.sdk }}
+          REPEAT_ID: ${{ matrix.repeat }}
+          EXECUTION_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payloadRoot = Join-Path $env:RUNNER_TEMP 'wpf-private\wpf-cleanroom-payload'
+          $privateRepo = Join-Path $payloadRoot 'repo'
+          $stage = Join-Path $env:RUNNER_TEMP "wpf-evidence-$env:TARGET-r$env:REPEAT_ID"
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          if (Test-Path -LiteralPath (Join-Path $privateRepo 'results')) {
+            Copy-Item -LiteralPath (Join-Path $privateRepo 'results') -Destination (Join-Path $stage 'results') -Recurse -Force
+          } else {
+            'RESULTS_DIRECTORY_MISSING' | Set-Content (Join-Path $stage 'results-missing.txt')
+          }
+          Copy-Item -LiteralPath (Join-Path $payloadRoot 'PAYLOAD_PROVENANCE.json') -Destination $stage -Force
+          Copy-Item -LiteralPath (Join-Path $payloadRoot "run-$env:TARGET.ps1") -Destination $stage -Force
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'wpf-payload-integrity.txt') -Destination $stage -Force
+
+          foreach ($suffix in @('stdout.log','stderr.log','exit.txt')) {
+            $path = Join-Path $env:RUNNER_TEMP "wpf-$env:TARGET-r$env:REPEAT_ID.$suffix"
+            if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $stage -Force }
+          }
+          $envFile = Join-Path $env:RUNNER_TEMP "wpf-env-$env:TARGET-r$env:REPEAT_ID.txt"
+          if (Test-Path -LiteralPath $envFile) { Copy-Item -LiteralPath $envFile -Destination $stage -Force }
+
+          @(
+            "TARGET=$env:TARGET"
+            "SDK_VERSION=$env:SDK_VERSION"
+            "REPEAT_ID=$env:REPEAT_ID"
+            "EXECUTION_OUTCOME=$env:EXECUTION_OUTCOME"
+            "GITHUB_RUN_ID=$env:GITHUB_RUN_ID"
+            "GITHUB_RUN_ATTEMPT=$env:GITHUB_RUN_ATTEMPT"
+            "GITHUB_SHA=$env:GITHUB_SHA"
+            "RUNNER_OS=$env:RUNNER_OS"
+            "RUNNER_ARCH=$env:RUNNER_ARCH"
+            "UTC=$([DateTime]::UtcNow.ToString('o'))"
+          ) | Set-Content (Join-Path $stage 'RUN_RECEIPT.txt')
+
+          Get-ChildItem -LiteralPath $stage -Recurse -Force -File |
+            Where-Object Name -ne 'SHA256SUMS.txt' |
+            Get-FileHash -Algorithm SHA256 |
+            Sort-Object Path |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $($_.Path.Substring($stage.Length + 1).Replace('\','/'))" } |
+            Set-Content (Join-Path $stage 'SHA256SUMS.txt')
+
+      - name: Remove decrypted private payload
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'wpf-private') -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'wpf-private.zip') -Force -ErrorAction SilentlyContinue
+
+      - name: Encrypt evidence before upload
+        if: always()
+        shell: pwsh
+        env:
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          TARGET: ${{ matrix.target }}
+          REPEAT_ID: ${{ matrix.repeat }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP "wpf-evidence-$env:TARGET-r$env:REPEAT_ID"
+          if (-not (Test-Path -LiteralPath $stage)) {
+            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+            'EVIDENCE_STAGE_MISSING' | Set-Content (Join-Path $stage 'status.txt')
+          }
+
+          $zipPath = Join-Path $env:RUNNER_TEMP "wpf-evidence-$env:TARGET-r$env:REPEAT_ID.zip"
+          Compress-Archive -LiteralPath $stage -DestinationPath $zipPath -Force
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+          $plainHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant()
+
+          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
+          $iv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.IV = $iv
+            $encryptor = $aes.CreateEncryptor()
+            try {
+              $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
+            } finally {
+              $encryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'evidence.enc'), $cipher)
+          [Convert]::ToBase64String($iv) | Set-Content (Join-Path $PWD 'evidence.iv.b64')
+          $plainHash | Set-Content (Join-Path $PWD 'evidence.plain.sha256')
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.cipher.sha256')
+
+          Remove-Item -LiteralPath $stage -Recurse -Force
+          Remove-Item -LiteralPath $zipPath -Force
+
+      - name: Upload encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpf-encrypted-${{ matrix.target }}-r${{ matrix.repeat }}
+          path: |
+            evidence.enc
+            evidence.iv.b64
+            evidence.plain.sha256
+            evidence.cipher.sha256
+          if-no-files-found: error
