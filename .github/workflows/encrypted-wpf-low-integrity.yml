@@ -96,15 +96,15 @@ jobs:
             -Destination (Join-Path $privateRoot 'main') `
             -Label 'wpf-main-v3'
           Expand-EncryptedPayload `
-            -CipherB64 'wpf-integrity-tools-payload-v3-cipher.b64' `
-            -CipherHash 'integrity-tools-v3.cipher.sha256' `
-            -PlainHash 'integrity-tools-v3.plain.sha256' `
-            -IvB64 'integrity-tools-v3.iv.b64' `
+            -CipherB64 'wpf-integrity-tools-payload-v4-cipher.b64' `
+            -CipherHash 'integrity-tools-v4.cipher.sha256' `
+            -PlainHash 'integrity-tools-v4.plain.sha256' `
+            -IvB64 'integrity-tools-v4.iv.b64' `
             -Destination (Join-Path $privateRoot 'integrity') `
-            -Label 'wpf-integrity-v3'
+            -Label 'wpf-integrity-v4'
 
           $mainRoot = Join-Path $privateRoot 'main\wpf-cleanroom-payload-v2'
-          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v3'
+          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v4'
           if (-not (Test-Path -LiteralPath (Join-Path $mainRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'main payload root missing' }
           if (-not (Test-Path -LiteralPath (Join-Path $integrityRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'integrity payload root missing' }
 
@@ -149,10 +149,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-low-private'
           $mainRoot = Join-Path $privateRoot 'main\wpf-cleanroom-payload-v2'
-          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v3'
+          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v4'
           $harness = Join-Path $mainRoot 'repo\validation_artifacts\20261112\wpf_stock_ctrlv_poc'
           $script = Join-Path $integrityRoot 'run-wpf-low-integrity.ps1'
-          $expectedScriptHash = '35c7ef1da0dde8542dc20725f671538abee8684cc048598726478bd9d0bc9c64'
+          $expectedScriptHash = '78561e9780a8981ae1f3fc7a6850bae361ccaad1d944ed0802c229b7272d48c6'
           $actualScriptHash = (Get-FileHash -LiteralPath $script -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualScriptHash -ne $expectedScriptHash) { throw "runner script hash mismatch: $actualScriptHash" }
           $tokens = $null; $parseErrors = $null
@@ -190,7 +190,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-low-private'
           $mainRoot = Join-Path $privateRoot 'main\wpf-cleanroom-payload-v2'
-          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v3'
+          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v4'
           $stage = Join-Path $env:RUNNER_TEMP "wpf-low-evidence-$env:TARGET"
           Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -203,8 +203,8 @@ jobs:
             (Join-Path $integrityRoot 'run-wpf-low-integrity.ps1'),
             (Join-Path $integrityRoot 'IntegrityLauncher\Program.cs'),
             (Join-Path $integrityRoot 'IntegrityLauncher\IntegrityLauncher.csproj'),
-            (Join-Path $integrityRoot 'NativeLowWriteProbe.cpp'),
-            (Join-Path $integrityRoot 'NativeClipboardPublisher.cpp'),
+            (Join-Path $integrityRoot 'NativeLowWriteProbe.c'),
+            (Join-Path $integrityRoot 'NativeClipboardPublisher.c'),
             (Join-Path $mainRoot 'PAYLOAD_PROVENANCE.json'),
             (Join-Path $mainRoot 'MANIFEST.json'),
             (Join-Path $privateRoot 'main\DECRYPTION_RECEIPT.txt'),
