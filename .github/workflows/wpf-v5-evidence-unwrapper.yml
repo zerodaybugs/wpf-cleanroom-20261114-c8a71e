@@ -1,0 +1,98 @@
+name: WPF v5 Evidence Unwrapper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  unwrap:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: net10
+            artifact_id: 14134746790
+          - target: net11
+            artifact_id: 14134258480
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+      WRAP_PUBLIC_PEM_B64: LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQm9qQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FZOEFNSUlCaWdLQ0FZRUFuamhPdUJUWXNyY1JXWTlxRXhWNQpwMWFKT2wzY1VMaGx2eFZYWDQzeTZ4MGdWWjlBUysyaEJocUZKWnNwT3ZaakFoRnFDa09SRW9tUnJPRmhtSjZjCmFOOURlMXNMOFZKN0pPUVh1bWtjUjJMdzB3enVRaEZ4ZzBsRDc1bkdGVzJLS2xtVldKLzdRcFRkMThlemFpNlAKc3hQRWpaV1kvZnZFcTNCY3FzbHF3VDl0dkl3ZG9pNnFWajRoMXpzZUEvdmFIMnhwWlRlMGtEZ210RGZQdXNRYQo4eEwzcHpVOWYxd0FpZkprQmUxUi9OL25QYjRzTVoyWm1vdkpGblZuTXB1bHRiczFhTUVXYUxUUDVOb1htcmF0Ck5ENkRybFpsQXVLODlONGZ0QUhWRGtSdG1ldzZXVm1ZSkg4RkZNVDNJQUNpcmhabVorYkRHWmJZdTdTNk54Q00KbmlaZVZSejFUOXduL05ldDJSVlRFY0k0SHJjVU9SM3ZMV1M5Wm9VMkphQ1cvN211WUU4cU5hMWRoRHZ4bldxRAozT2FGM2JjQWY4SC9nTGs2QWFBRzdON1BqNDR1d05La2VJa29zd3dtMmdscGJscnRNR1Zua2ZiVVVzWk41dmovCkNWN3lwMHUxUHVzUHNEbWx2VUpSWVhWQ3R1NGJxY1hBNFMxRkdBRndTeWIxQWdNQkFBRT0KLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg==
+
+    steps:
+      - name: Download and verify encrypted evidence artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p outer evidence wrapped
+          curl -fsSL -L \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ matrix.artifact_id }}/zip" \
+            -o outer.zip
+          unzip -q outer.zip -d outer
+          test -s outer/evidence.enc
+          test -s outer/evidence.iv.b64
+          test -s outer/evidence.plain.sha256
+          test -s outer/evidence.cipher.sha256
+          actual_cipher="$(sha256sum outer/evidence.enc | awk '{print $1}')"
+          expected_cipher="$(tr -d '\r\n ' < outer/evidence.cipher.sha256)"
+          test "${actual_cipher}" = "${expected_cipher}"
+          printf '%s' "${PAYLOAD_KEY_B64}" | base64 -d > payload.key
+          test "$(stat -c%s payload.key)" -eq 32
+          base64 -d outer/evidence.iv.b64 > payload.iv
+          test "$(stat -c%s payload.iv)" -eq 16
+          key_hex="$(xxd -p -c 256 payload.key)"
+          iv_hex="$(xxd -p -c 256 payload.iv)"
+          openssl enc -d -aes-256-cbc -K "${key_hex}" -iv "${iv_hex}" \
+            -in outer/evidence.enc -out evidence.zip
+          actual_plain="$(sha256sum evidence.zip | awk '{print $1}')"
+          expected_plain="$(tr -d '\r\n ' < outer/evidence.plain.sha256)"
+          test "${actual_plain}" = "${expected_plain}"
+          unzip -q evidence.zip -d evidence
+          printf 'TARGET=%s\nSOURCE_ARTIFACT_ID=%s\nSOURCE_CIPHER_SHA256=%s\nSOURCE_PLAIN_SHA256=%s\n' \
+            '${{ matrix.target }}' '${{ matrix.artifact_id }}' "${actual_cipher}" "${actual_plain}" \
+            > evidence/UNWRAP_RECEIPT.txt
+
+      - name: Re-encrypt recovered evidence to one-time RSA recipient
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -q -r recovered-evidence.zip evidence
+          openssl rand 32 > wrap.key
+          openssl rand 16 > wrap.iv
+          openssl enc -aes-256-cbc \
+            -K "$(xxd -p -c 256 wrap.key)" \
+            -iv "$(xxd -p -c 256 wrap.iv)" \
+            -in recovered-evidence.zip -out wrapped/evidence.enc
+          printf '%s' "${WRAP_PUBLIC_PEM_B64}" | base64 -d > wrap-public.pem
+          openssl pkeyutl -encrypt -pubin -inkey wrap-public.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256 \
+            -in wrap.key -out wrapped/wrap.key.enc
+          cp wrap.iv wrapped/wrap.iv
+          sha256sum recovered-evidence.zip | awk '{print $1}' > wrapped/evidence.plain.sha256
+          sha256sum wrapped/evidence.enc | awk '{print $1}' > wrapped/evidence.cipher.sha256
+          sha256sum wrapped/wrap.key.enc | awk '{print $1}' > wrapped/wrap.key.enc.sha256
+          printf 'TARGET=%s\nSOURCE_RUN_ID=43645568441\nSOURCE_ARTIFACT_ID=%s\nRECIPIENT_PUBLIC_KEY_SHA256=e7a30db0d7488edb3d2c3d60976edb744cd51cc48d6d84f7e733367a21f0405e\n' \
+            '${{ matrix.target }}' '${{ matrix.artifact_id }}' > wrapped/METADATA.txt
+
+      - name: Remove recovered plaintext and keys
+        if: always()
+        shell: bash
+        run: |
+          rm -rf outer evidence outer.zip evidence.zip recovered-evidence.zip payload.key payload.iv wrap.key wrap-public.pem
+
+      - name: Upload RSA-wrapped evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpf-v5-rsa-wrapped-${{ matrix.target }}
+          path: wrapped/
+          if-no-files-found: error
+          retention-days: 1
