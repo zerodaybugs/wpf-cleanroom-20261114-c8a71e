@@ -113,7 +113,7 @@ jobs:
 
           cp -a "$main_root/repo/validation_artifacts/20261112/wpf_stock_ctrlv_poc" "$export_root/poc/wpf-stock-ctrlv"
           cp -a "$integrity_root" "$export_root/poc/integrity-tools"
-          cp .github/workflows/encrypted-wpf-matrix.yml "$export_root/receipts/"
+          cp .github/workflows/encrypted-wpf-current.yml "$export_root/receipts/"
           cp .github/workflows/encrypted-wpf-low-integrity-v8-aspan.yml "$export_root/receipts/"
 
           fetch_run() {
