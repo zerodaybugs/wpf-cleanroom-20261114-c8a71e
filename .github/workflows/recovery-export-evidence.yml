@@ -26,7 +26,9 @@ jobs:
           AUTHORITY_RUN: ${{ inputs.authority_run }}
           BASE_RUN: '43615002342'
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'echo "EXPORT_FAILURE line=$LINENO command=$BASH_COMMAND" >&2' ERR
+          echo "EXPORT_PHASE=START"
           work="$RUNNER_TEMP/wpf-recovery-export"
           export_root="$work/export"
           rm -rf "$work"
@@ -81,6 +83,7 @@ jobs:
             printf 'label=%s\ncipher_sha256=%s\nplain_sha256=%s\n' "$label" "$actual_cipher" "$actual_plain" > "$export_root/receipts/$label.txt"
           }
 
+          echo "EXPORT_PHASE=DECRYPT_REPO_PAYLOADS"
           decrypt_repo_payload main-v3 wpf-payload-v3-cipher.b64 payload-v3.cipher.sha256 payload-v3.plain.sha256 payload-v3.iv.b64 "$work/main"
           decrypt_repo_payload integrity-v5 wpf-integrity-tools-payload-v5-cipher.b64 integrity-tools-v5.cipher.sha256 integrity-tools-v5.plain.sha256 integrity-tools-v5.iv.b64 "$work/integrity"
 
@@ -111,9 +114,10 @@ jobs:
           assert hashlib.sha256(p.read_bytes()).hexdigest()=='cf680e341a6f1a1e5d0728d90b313be1ae1818ec430d01987f850a7a24b1bfb7'
           PY
 
+          echo "EXPORT_PHASE=STAGE_POC"
           cp -a "$main_root/repo/validation_artifacts/20261112/wpf_stock_ctrlv_poc" "$export_root/poc/wpf-stock-ctrlv"
           cp -a "$integrity_root" "$export_root/poc/integrity-tools"
-          cp .github/workflows/encrypted-wpf-current.yml "$export_root/receipts/"
+          cp .github/workflows/encrypted-wpf-matrix.yml "$export_root/receipts/"
           cp .github/workflows/encrypted-wpf-low-integrity-v8-aspan.yml "$export_root/receipts/"
 
           fetch_run() {
@@ -156,9 +160,12 @@ jobs:
             done
           }
 
+          echo "EXPORT_PHASE=FETCH_BASE"
           fetch_run base "$BASE_RUN" "$export_root/evidence/base-current-matrix"
+          echo "EXPORT_PHASE=FETCH_AUTHORITY"
           fetch_run authority "$AUTHORITY_RUN" "$export_root/evidence/authority-v8"
 
+          echo "EXPORT_PHASE=ASSERT_LAYOUT"
           test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net10-r1"
           test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net10-r2"
           test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net10-r3"
@@ -178,6 +185,7 @@ jobs:
           EOF
           sed -i 's/^          //' "$export_root/EXPORT_RECEIPT.txt"
 
+          echo "EXPORT_PHASE=PACKAGE"
           find "$export_root" -type f ! -name SHA256SUMS.txt -print0 | sort -z |
             while IFS= read -r -d '' f; do printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "${f#$export_root/}"; done > "$export_root/SHA256SUMS.txt"
           file_count=$(find "$export_root" -type f | wc -l)
