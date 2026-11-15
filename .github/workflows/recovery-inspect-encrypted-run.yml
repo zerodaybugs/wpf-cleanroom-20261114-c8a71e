@@ -1,0 +1,100 @@
+name: Recovery Inspect Encrypted WPF Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Workflow run ID to inspect
+        required: true
+        default: '43652838115'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download, verify, decrypt, and print bounded diagnostics
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          RUN_ID: ${{ inputs.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -n "$PAYLOAD_KEY_B64"
+          work="$RUNNER_TEMP/recovery-inspect"
+          rm -rf "$work"
+          mkdir -p "$work"
+
+          api="https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/artifacts?per_page=100"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api" > "$work/artifacts.json"
+
+          count=$(jq '.artifacts | length' "$work/artifacts.json")
+          echo "RUN_ID=$RUN_ID"
+          echo "ARTIFACT_COUNT=$count"
+          test "$count" -gt 0
+
+          keyhex=$(printf '%s' "$PAYLOAD_KEY_B64" | base64 -d | xxd -p -c 256)
+          test ${#keyhex} -eq 64
+
+          jq -r '.artifacts[] | [.id,.name,.archive_download_url,.digest] | @tsv' "$work/artifacts.json" |
+          while IFS=$'\t' read -r artifact_id artifact_name download_url digest; do
+            echo "===== ARTIFACT $artifact_name ($artifact_id) ====="
+            outer="$work/$artifact_name.outer.zip"
+            outer_dir="$work/$artifact_name.outer"
+            plain_zip="$work/$artifact_name.plain.zip"
+            plain_dir="$work/$artifact_name.plain"
+            mkdir -p "$outer_dir" "$plain_dir"
+
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$download_url" -o "$outer"
+            outer_sha=$(sha256sum "$outer" | awk '{print $1}')
+            echo "OUTER_SHA256=$outer_sha"
+            echo "API_DIGEST=$digest"
+            unzip -q "$outer" -d "$outer_dir"
+
+            cipher_sha=$(sha256sum "$outer_dir/evidence.enc" | awk '{print $1}')
+            expected_cipher=$(tr -d '\r\n ' < "$outer_dir/evidence.cipher.sha256")
+            test "$cipher_sha" = "$expected_cipher"
+            ivhex=$(base64 -d < "$outer_dir/evidence.iv.b64" | xxd -p -c 256)
+            openssl enc -d -aes-256-cbc -K "$keyhex" -iv "$ivhex" \
+              -in "$outer_dir/evidence.enc" -out "$plain_zip"
+            plain_sha=$(sha256sum "$plain_zip" | awk '{print $1}')
+            expected_plain=$(tr -d '\r\n ' < "$outer_dir/evidence.plain.sha256")
+            test "$plain_sha" = "$expected_plain"
+            echo "CIPHER_SHA256=$cipher_sha"
+            echo "PLAIN_SHA256=$plain_sha"
+            unzip -q "$plain_zip" -d "$plain_dir"
+
+            echo "-- inventory --"
+            find "$plain_dir" -type f -printf '%P %s\n' | sort
+            echo "-- bounded diagnostics --"
+            while IFS= read -r f; do
+              echo "### ${f#$plain_dir/}"
+              sed -n '1,240p' "$f"
+            done < <(find "$plain_dir" -type f \( \
+              -name 'wpf-low-*.stderr.log' -o \
+              -name 'wpf-low-*.exit.txt' -o \
+              -name '*.launch.console.txt' -o \
+              -name '*.launch.json' -o \
+              -name 'low-write-receipt.txt' -o \
+              -name '*publisher.txt' -o \
+              -name 'driver-*.txt' -o \
+              -name 'process-trace-*.txt' -o \
+              -name 'marker-*.txt' -o \
+              -name 'server-*-assertion.txt' -o \
+              -name 'wrong-format-authority-control.txt' -o \
+              -name 'VERDICT.txt' \
+            \) | sort)
+          done
