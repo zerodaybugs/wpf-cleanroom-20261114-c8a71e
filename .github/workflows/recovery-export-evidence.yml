@@ -1,0 +1,204 @@
+name: Recovery Export WPF Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      authority_run:
+        description: Successful v8 authority run ID
+        required: true
+        default: '43696626922'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and encrypt canonical evidence export
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          REPO: ${{ github.repository }}
+          AUTHORITY_RUN: ${{ inputs.authority_run }}
+          BASE_RUN: '43615002342'
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/wpf-recovery-export"
+          export_root="$work/export"
+          rm -rf "$work"
+          mkdir -p "$export_root/poc" "$export_root/evidence/base-current-matrix" "$export_root/evidence/authority-v8" "$export_root/receipts"
+
+          cat > "$work/recovery-cert.pem" <<'CERT'
+          -----BEGIN CERTIFICATE-----
+          MIIEHTCCAoWgAwIBAgIUNYUj1qkNMh2kHbr5rsMUpEM4UC8wDQYJKoZIhvcNAQEL
+          BQAwHjEcMBoGA1UEAwwTV1BGIFJlY292ZXJ5IEV4cG9ydDAeFw0yNjExMTUwODU0
+          NDFaFw0yNjExMTcwODU0NDFaMB4xHDAaBgNVBAMME1dQRiBSZWNvdmVyeSBFeHBv
+          cnQwggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQC1g6RUCmh1eFx4+YuL
+          tPXWbw9gMNH7wTH6NPk0hYJCi69r6ru+nSqjTsAycZnbLrfRgp5R5JXz3Y7n6iAv
+          wurhXl7lhxE3igjHsNX6zkhUwudDypI1pWEIrUEuxDk9Lybe6Pxf6dSD02Bjeo3/
+          wM+5Kk3UjdvP8ytXxZswX4hrD8eo4zvU+dZUWcil2VVgLvToliCQU1iy4lBRvuBo
+          qIFJlm2IuKnEZla7/KU/S9VGSR0grmKT9Gb0BiwTpJTKTY88WuGMxaHKZyzVF1OM
+          PRd3xgxMuJfquEhud+yI1WdxSHhDz2B92myOj4UbUwvPR4yeFkLnSa0dD43+zOu7
+          E3v4DLjsXNSfXqbkLJeO/Zek2YMxUQf3ak4zbNXczgxAABKGnj+S8nB8XhyesMsA
+          SnfD6ZSjVkuuzZd0eFWQlpW1YouHH1sq842PvCxUuIKYCzT8CpQuk/+lyR5hVgqu
+          Mw9dzPJOVxvie9IGzlR7wn7R6JqwecFJVxvqtdA63Z+qeWsCAwEAAaNTMFEwHQYD
+          VR0OBBYEFAUDfEHL1RDzsjGHzsr/cYe5dYT+MB8GA1UdIwQYMBaAFAUDfEHL1RDz
+          sjGHzsr/cYe5dYT+MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGB
+          AJg3IdKdEYwR+Lm6dIoYoIREhqwwAs6vcU3Uq2OF+N9xI2cwGskz/cgeU7ef7cIu
+          OiCx4Umctm6adST+3zSS5qpvNU+oBEMUDrADXwg3npdmOZM8Nyjm1FBDnKGwPmvr
+          hc4GrSbfcii27srXX4objJM+gYz7VdKT65UcURrbACMNQavw00BxGRuO54dRjYlI
+          GYCxlS3uevtaNQ38mntkRkOlIktRxolIp0KtKPzkTYbS39miiOt08LUAKeEkAxW8
+          Wcc0kh0EHheCJFZn9HzDiDKKwVNNkdVbbRm66h1dmzLVAEsV3ip1kP3Nf6P5TPDX
+          t/VvnPW78Z05P217I1Y8VKDMcp5XNKDYGUiJ1xHqEf6NKhnRsJBzlbdmesaBtlKd
+          sj8xyEcrqXXMcNAhx8Mf0H0kc7mhfNdFEbB6hURAvfF6VFLTvVohL+387vJnT3tD
+          +cal5AQfmclx77vs4b9+ofLeoi2/WxVmXIPs8icVvwz5rTOdPC/wLUF5NRJe2I7G
+          JQ==
+          -----END CERTIFICATE-----
+          CERT
+          sed -i 's/^          //' "$work/recovery-cert.pem"
+
+          test -n "$PAYLOAD_KEY_B64"
+          keyhex=$(printf '%s' "$PAYLOAD_KEY_B64" | base64 -d | xxd -p -c 256)
+          test ${#keyhex} -eq 64
+
+          decrypt_repo_payload() {
+            label="$1"; cipher_b64="$2"; cipher_hash_file="$3"; plain_hash_file="$4"; iv_file="$5"; dest="$6"
+            mkdir -p "$dest"
+            base64 -d < "$cipher_b64" > "$work/$label.enc"
+            actual_cipher=$(sha256sum "$work/$label.enc" | awk '{print $1}')
+            expected_cipher=$(tr -d '\r\n ' < "$cipher_hash_file")
+            test "$actual_cipher" = "$expected_cipher"
+            ivhex=$(base64 -d < "$iv_file" | xxd -p -c 256)
+            openssl enc -d -aes-256-cbc -K "$keyhex" -iv "$ivhex" -in "$work/$label.enc" -out "$work/$label.zip"
+            actual_plain=$(sha256sum "$work/$label.zip" | awk '{print $1}')
+            expected_plain=$(tr -d '\r\n ' < "$plain_hash_file")
+            test "$actual_plain" = "$expected_plain"
+            unzip -q "$work/$label.zip" -d "$dest"
+            printf 'label=%s\ncipher_sha256=%s\nplain_sha256=%s\n' "$label" "$actual_cipher" "$actual_plain" > "$export_root/receipts/$label.txt"
+          }
+
+          decrypt_repo_payload main-v3 wpf-payload-v3-cipher.b64 payload-v3.cipher.sha256 payload-v3.plain.sha256 payload-v3.iv.b64 "$work/main"
+          decrypt_repo_payload integrity-v5 wpf-integrity-tools-payload-v5-cipher.b64 integrity-tools-v5.cipher.sha256 integrity-tools-v5.plain.sha256 integrity-tools-v5.iv.b64 "$work/integrity"
+
+          main_root="$work/main/wpf-cleanroom-payload-v2"
+          integrity_root="$work/integrity/wpf-integrity-tools-payload-v5"
+          test -d "$main_root/repo/validation_artifacts/20261112/wpf_stock_ctrlv_poc"
+          test -f "$integrity_root/run-wpf-low-integrity.ps1"
+          test "$(sha256sum "$integrity_root/run-wpf-low-integrity.ps1" | awk '{print $1}')" = '378462ac2a2ce8596515697e1403f52798aa388973e750ca0d640761d27f26d7'
+
+          python3 - <<'PY'
+          import re,base64,pathlib
+          wf=pathlib.Path('.github/workflows/encrypted-wpf-low-integrity-v7write-lf.yml').read_text()
+          b64=re.search(r"FromBase64String\('([^']+)'\)",wf).group(1)
+          pathlib.Path('/tmp/v7.diff').write_bytes(base64.b64decode(b64))
+          PY
+          (cd "$integrity_root" && git apply --no-index --whitespace=nowarn /tmp/v7.diff)
+          python3 - "$integrity_root/run-wpf-low-integrity.ps1" <<'PY'
+          import pathlib,sys,hashlib
+          p=pathlib.Path(sys.argv[1])
+          s=p.read_text(encoding='utf-8').replace('\r\n','\n')
+          p.write_text(s,encoding='utf-8',newline='\n')
+          assert hashlib.sha256(p.read_bytes()).hexdigest()=='3d78cbea34d0ee4d026ff1f848bc6bc1b66fbcd20b7daf229e8dda968e9d1a25'
+          old="if(-not $actual.AsSpan().SequenceEqual($expected)){ throw 'Marker bytes differ from nonce.' }"
+          new="if($actual.Length -ne $expected.Length -or (Get-Sha256Hex $actual) -ne (Get-Sha256Hex $expected)){ throw 'Marker bytes differ from nonce.' }"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          p.write_text(s,encoding='utf-8',newline='\n')
+          assert hashlib.sha256(p.read_bytes()).hexdigest()=='cf680e341a6f1a1e5d0728d90b313be1ae1818ec430d01987f850a7a24b1bfb7'
+          PY
+
+          cp -a "$main_root/repo/validation_artifacts/20261112/wpf_stock_ctrlv_poc" "$export_root/poc/wpf-stock-ctrlv"
+          cp -a "$integrity_root" "$export_root/poc/integrity-tools"
+          cp .github/workflows/encrypted-wpf-matrix.yml "$export_root/receipts/"
+          cp .github/workflows/encrypted-wpf-low-integrity-v8-aspan.yml "$export_root/receipts/"
+
+          fetch_run() {
+            family="$1"; run_id="$2"; target_dir="$3"
+            mkdir -p "$target_dir"
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/actions/runs/$run_id" > "$export_root/receipts/run-$run_id.json"
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/actions/runs/$run_id/artifacts?per_page=100" > "$export_root/receipts/artifacts-$run_id.json"
+            status=$(jq -r '.status' "$export_root/receipts/run-$run_id.json")
+            conclusion=$(jq -r '.conclusion' "$export_root/receipts/run-$run_id.json")
+            test "$status" = completed
+            test "$conclusion" = success
+
+            jq -r '.artifacts[] | [.id,.name,.archive_download_url,.digest] | @tsv' "$export_root/receipts/artifacts-$run_id.json" |
+            while IFS=$'\t' read -r artifact_id artifact_name download_url digest; do
+              outer="$work/$family-$artifact_name.outer.zip"
+              outer_dir="$work/$family-$artifact_name.outer"
+              plain_zip="$work/$family-$artifact_name.plain.zip"
+              dest="$target_dir/$artifact_name"
+              rm -rf "$outer_dir" "$dest"; mkdir -p "$outer_dir" "$dest"
+              curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" "$download_url" -o "$outer"
+              outer_sha=$(sha256sum "$outer" | awk '{print $1}')
+              if [[ "$digest" == sha256:* ]]; then test "$outer_sha" = "${digest#sha256:}"; fi
+              unzip -q "$outer" -d "$outer_dir"
+              actual_cipher=$(sha256sum "$outer_dir/evidence.enc" | awk '{print $1}')
+              expected_cipher=$(tr -d '\r\n ' < "$outer_dir/evidence.cipher.sha256")
+              test "$actual_cipher" = "$expected_cipher"
+              ivhex=$(base64 -d < "$outer_dir/evidence.iv.b64" | xxd -p -c 256)
+              openssl enc -d -aes-256-cbc -K "$keyhex" -iv "$ivhex" -in "$outer_dir/evidence.enc" -out "$plain_zip"
+              actual_plain=$(sha256sum "$plain_zip" | awk '{print $1}')
+              expected_plain=$(tr -d '\r\n ' < "$outer_dir/evidence.plain.sha256")
+              test "$actual_plain" = "$expected_plain"
+              unzip -q "$plain_zip" -d "$dest"
+              printf 'artifact_id=%s\nartifact_name=%s\nouter_sha256=%s\ncipher_sha256=%s\nplain_sha256=%s\n' \
+                "$artifact_id" "$artifact_name" "$outer_sha" "$actual_cipher" "$actual_plain" > "$dest/ARTIFACT_RECOVERY_RECEIPT.txt"
+            done
+          }
+
+          fetch_run base "$BASE_RUN" "$export_root/evidence/base-current-matrix"
+          fetch_run authority "$AUTHORITY_RUN" "$export_root/evidence/authority-v8"
+
+          test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net10-r1"
+          test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net10-r2"
+          test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net10-r3"
+          test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net11-r1"
+          test -d "$export_root/evidence/authority-v8/wpf-low-v8-encrypted-net10"
+          test -d "$export_root/evidence/authority-v8/wpf-low-v8-encrypted-net11"
+          grep -Rqx 'VERDICT=LOW_TO_MEDIUM_STOCK_WPF_CLIPBOARD_PROTECTED_WRITE_PASS' "$export_root/evidence/authority-v8"/*/*/results/VERDICT.txt
+
+          cat > "$export_root/EXPORT_RECEIPT.txt" <<EOF
+          schema=zdb.wpf.recovery-export.v1
+          repository=$REPO
+          base_run=$BASE_RUN
+          authority_run=$AUTHORITY_RUN
+          authority_commit=$(jq -r '.head_sha' "$export_root/receipts/run-$AUTHORITY_RUN.json")
+          generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          v8_runner_sha256=cf680e341a6f1a1e5d0728d90b313be1ae1818ec430d01987f850a7a24b1bfb7
+          EOF
+          sed -i 's/^          //' "$export_root/EXPORT_RECEIPT.txt"
+
+          find "$export_root" -type f ! -name SHA256SUMS.txt -print0 | sort -z |
+            while IFS= read -r -d '' f; do printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "${f#$export_root/}"; done > "$export_root/SHA256SUMS.txt"
+          file_count=$(find "$export_root" -type f | wc -l)
+          (cd "$work" && zip -q -r -9 evidence-export.zip export)
+          plain_sha=$(sha256sum "$work/evidence-export.zip" | awk '{print $1}')
+          openssl cms -encrypt -binary -aes256 -in "$work/evidence-export.zip" -outform DER -out "$GITHUB_WORKSPACE/wpf-recovery-evidence.p7m" "$work/recovery-cert.pem"
+          cipher_sha=$(sha256sum "$GITHUB_WORKSPACE/wpf-recovery-evidence.p7m" | awk '{print $1}')
+          printf '%s\n' "$plain_sha" > "$GITHUB_WORKSPACE/wpf-recovery-evidence.plain.sha256"
+          printf '%s\n' "$cipher_sha" > "$GITHUB_WORKSPACE/wpf-recovery-evidence.cipher.sha256"
+          printf 'authority_run=%s\nbase_run=%s\nfile_count=%s\nplain_sha256=%s\ncipher_sha256=%s\ncert_sha256_fingerprint=67:9C:B3:11:BB:1C:13:26:F7:70:2C:F9:8F:B2:95:04:45:EF:8A:02:CC:A4:B3:91:5C:74:98:1D:AC:4E:99:14\n' \
+            "$AUTHORITY_RUN" "$BASE_RUN" "$file_count" "$plain_sha" "$cipher_sha" > "$GITHUB_WORKSPACE/wpf-recovery-evidence.receipt.txt"
+          rm -rf "$work/export" "$work/evidence-export.zip" "$work/main" "$work/integrity"
+
+      - name: Upload encrypted recovery export
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpf-recovery-export-${{ inputs.authority_run }}
+          path: |
+            wpf-recovery-evidence.p7m
+            wpf-recovery-evidence.plain.sha256
+            wpf-recovery-evidence.cipher.sha256
+            wpf-recovery-evidence.receipt.txt
+          if-no-files-found: error
+          retention-days: 7
