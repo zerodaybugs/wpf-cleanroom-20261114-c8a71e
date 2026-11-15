@@ -1,0 +1,323 @@
+name: Encrypted WPF Low-Integrity Boundary V8
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - target: net10
+            tfm: net10.0-windows
+            sdk: 10.0.404
+            runtime: 10.0.15
+            presentation: 10.0.0.0
+            port: 8127
+          - target: net11
+            tfm: net11.0-windows
+            sdk: 11.0.100
+            runtime: 11.0.0
+            presentation: 11.0.0.0
+            port: 8128
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Decrypt and verify private payloads
+        shell: pwsh
+        env:
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:PAYLOAD_KEY_B64)) { throw 'payload key missing' }
+          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
+          if ($key.Length -ne 32) { throw 'payload key must be 32 bytes' }
+
+          function Expand-EncryptedPayload {
+            param(
+              [Parameter(Mandatory=$true)][string]$CipherB64,
+              [Parameter(Mandatory=$true)][string]$CipherHash,
+              [Parameter(Mandatory=$true)][string]$PlainHash,
+              [Parameter(Mandatory=$true)][string]$IvB64,
+              [Parameter(Mandatory=$true)][string]$Destination,
+              [Parameter(Mandatory=$true)][string]$Label
+            )
+            $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath $CipherB64 -Raw).Trim())
+            $actualCipher = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
+            $expectedCipher = (Get-Content -LiteralPath $CipherHash -Raw).Trim().ToLowerInvariant()
+            if ($actualCipher -ne $expectedCipher) { throw "$Label cipher hash mismatch: $actualCipher" }
+            $iv = [Convert]::FromBase64String((Get-Content -LiteralPath $IvB64 -Raw).Trim())
+            $aes = [Security.Cryptography.Aes]::Create()
+            try {
+              $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+              $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+              $aes.Key = $key
+              $aes.IV = $iv
+              $decryptor = $aes.CreateDecryptor()
+              try { $plain = $decryptor.TransformFinalBlock($cipher, 0, $cipher.Length) }
+              finally { $decryptor.Dispose() }
+            }
+            finally { $aes.Dispose() }
+            $actualPlain = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant()
+            $expectedPlain = (Get-Content -LiteralPath $PlainHash -Raw).Trim().ToLowerInvariant()
+            if ($actualPlain -ne $expectedPlain) { throw "$Label plaintext hash mismatch: $actualPlain" }
+            $zip = Join-Path $env:RUNNER_TEMP "$Label.zip"
+            [IO.File]::WriteAllBytes($zip, $plain)
+            Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+            Expand-Archive -LiteralPath $zip -DestinationPath $Destination -Force
+            Remove-Item -LiteralPath $zip -Force
+            @(
+              "LABEL=$Label"
+              "CIPHER_SHA256=$actualCipher"
+              "PLAIN_SHA256=$actualPlain"
+            ) | Set-Content (Join-Path $Destination 'DECRYPTION_RECEIPT.txt')
+          }
+
+          $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-low-private'
+          New-Item -ItemType Directory -Force -Path $privateRoot | Out-Null
+          Expand-EncryptedPayload `
+            -CipherB64 'wpf-payload-v3-cipher.b64' `
+            -CipherHash 'payload-v3.cipher.sha256' `
+            -PlainHash 'payload-v3.plain.sha256' `
+            -IvB64 'payload-v3.iv.b64' `
+            -Destination (Join-Path $privateRoot 'main') `
+            -Label 'wpf-main-v3'
+          Expand-EncryptedPayload `
+            -CipherB64 'wpf-integrity-tools-payload-v5-cipher.b64' `
+            -CipherHash 'integrity-tools-v5.cipher.sha256' `
+            -PlainHash 'integrity-tools-v5.plain.sha256' `
+            -IvB64 'integrity-tools-v5.iv.b64' `
+            -Destination (Join-Path $privateRoot 'integrity') `
+            -Label 'wpf-integrity-v5'
+
+          $mainRoot = Join-Path $privateRoot 'main\wpf-cleanroom-payload-v2'
+          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v5'
+          if (-not (Test-Path -LiteralPath (Join-Path $mainRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'main payload root missing' }
+          if (-not (Test-Path -LiteralPath (Join-Path $integrityRoot 'PAYLOAD_PROVENANCE.json'))) { throw 'integrity payload root missing' }
+
+          $mainProvenancePath = Join-Path $mainRoot 'PAYLOAD_PROVENANCE.json'
+          $mainProvenance = Get-Content -LiteralPath $mainProvenancePath -Raw | ConvertFrom-Json
+          if ([string]$mainProvenance.source_commit -ne 'e36968255a9bfbf9507ebd3b7e5224d7901f9fb8' -or
+              [string]$mainProvenance.source_archive_sha256 -ne '97d9d41b2c85ff20ef903d8590e258b1511674c0eb4bd360311e734ce7d1a3f5' -or
+              [string]$mainProvenance.wrapper_generation -ne 'v3-runtimeconfig-property-safe') {
+            throw 'main payload provenance mismatch'
+          }
+          foreach ($entry in $mainProvenance.files) {
+            $path = Join-Path $mainRoot ([string]$entry.path)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "main provenance file missing: $path" }
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne [string]$entry.sha256 -or (Get-Item -LiteralPath $path).Length -ne [int64]$entry.bytes) {
+              throw "main provenance mismatch: $path"
+            }
+          }
+
+          $integrityManifestPath = Join-Path $integrityRoot 'MANIFEST.json'
+          $integrityManifest = Get-Content -LiteralPath $integrityManifestPath -Raw | ConvertFrom-Json
+          foreach ($entry in $integrityManifest.files) {
+            $path = Join-Path $integrityRoot ([string]$entry.path)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "integrity manifest file missing: $path" }
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne [string]$entry.sha256 -or (Get-Item -LiteralPath $path).Length -ne [int64]$entry.bytes) {
+              throw "integrity manifest mismatch: $path"
+            }
+          }
+
+      - name: Execute low-to-medium WPF boundary validation
+        id: execute
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          TFM: ${{ matrix.tfm }}
+          SDK_VERSION: ${{ matrix.sdk }}
+          RUNTIME_VERSION: ${{ matrix.runtime }}
+          PRESENTATION_VERSION: ${{ matrix.presentation }}
+          PORT: ${{ matrix.port }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-low-private'
+          $mainRoot = Join-Path $privateRoot 'main\wpf-cleanroom-payload-v2'
+          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v5'
+          $harness = Join-Path $mainRoot 'repo\validation_artifacts\20261112\wpf_stock_ctrlv_poc'
+          $script = Join-Path $integrityRoot 'run-wpf-low-integrity.ps1'
+          $baseScriptHash = (Get-FileHash -LiteralPath $script -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($baseScriptHash -ne '378462ac2a2ce8596515697e1403f52798aa388973e750ca0d640761d27f26d7') { throw "v5 base runner hash mismatch: $baseScriptHash" }
+          $patchPath = Join-Path $env:RUNNER_TEMP 'v5-to-v7-protected-write.diff'
+          [IO.File]::WriteAllBytes($patchPath,[Convert]::FromBase64String('LS0tIGEvcnVuLXdwZi1sb3ctaW50ZWdyaXR5LnBzMQorKysgYi9ydW4td3BmLWxvdy1pbnRlZ3JpdHkucHMxCkBAIC0zOCw5ICszOCwxNCBAQAogICAgIHJldHVybiBbQ29udmVydF06OlRvSGV4U3RyaW5nKFtTZWN1cml0eS5DcnlwdG9ncmFwaHkuUmFuZG9tTnVtYmVyR2VuZXJhdG9yXTo6R2V0Qnl0ZXMoMTYpKQogfQogZnVuY3Rpb24gQ2xlYXItUmVzZWFyY2hDbGlwYm9hcmQgeworICAgICRleGU9KEdldC1Db21tYW5kIHBvd2Vyc2hlbGwuZXhlKS5Tb3VyY2UKICAgICBmb3IoJGk9MDskaSAtbHQgMTA7JGkrKyl7Ci0gICAgICAgICYgcG93ZXJzaGVsbC5leGUgLU5vUHJvZmlsZSAtU3RhIC1Db21tYW5kICJBZGQtVHlwZSAtQXNzZW1ibHlOYW1lIFN5c3RlbS5XaW5kb3dzLkZvcm1zOyBbU3lzdGVtLldpbmRvd3MuRm9ybXMuQ2xpcGJvYXJkXTo6Q2xlYXIoKSIgfCBPdXQtTnVsbAotICAgICAgICBpZigkTEFTVEVYSVRDT0RFIC1lcSAwKXsgcmV0dXJuIH0KKyAgICAgICAgJHNpPVtEaWFnbm9zdGljcy5Qcm9jZXNzU3RhcnRJbmZvXTo6bmV3KCk7JHNpLkZpbGVOYW1lPSRleGU7JHNpLlVzZVNoZWxsRXhlY3V0ZT0kZmFsc2U7JHNpLkNyZWF0ZU5vV2luZG93PSR0cnVlCisgICAgICAgIGZvcmVhY2goJGEgaW4gQCgnLU5vUHJvZmlsZScsJy1TdGEnLCctQ29tbWFuZCcsJ0FkZC1UeXBlIC1Bc3NlbWJseU5hbWUgU3lzdGVtLldpbmRvd3MuRm9ybXM7IFtTeXN0ZW0uV2luZG93cy5Gb3Jtcy5DbGlwYm9hcmRdOjpDbGVhcigpJykpeyRzaS5Bcmd1bWVudExpc3QuQWRkKCRhKX0KKyAgICAgICAgJHA9W0RpYWdub3N0aWNzLlByb2Nlc3NdOjpuZXcoKTskcC5TdGFydEluZm89JHNpCisgICAgICAgIGlmKC1ub3QgJHAuU3RhcnQoKSl7Y29udGludWV9CisgICAgICAgIGlmKC1ub3QgJHAuV2FpdEZvckV4aXQoNTAwMCkpe3RyeXskcC5LaWxsKCR0cnVlKX1jYXRjaHt9O3RyeXskcC5XYWl0Rm9yRXhpdCgyMDAwKXxPdXQtTnVsbH1jYXRjaHt9O2NvbnRpbnVlfQorICAgICAgICBpZigkcC5FeGl0Q29kZSAtZXEgMCl7cmV0dXJufQogICAgICAgICBTdGFydC1TbGVlcCAtTWlsbGlzZWNvbmRzIDE1MAogICAgIH0KICAgICB0aHJvdyAnQ2xpcGJvYXJkIGNsZWFyIGZhaWxlZC4nCkBAIC0xODYsMTAgKzE5MSwxMCBAQAogZnVuY3Rpb24gV3JpdGUtTW9kdWxlUmVjZWlwdChbRGlhZ25vc3RpY3MuUHJvY2Vzc10kUHJvY2Vzcyxbc3RyaW5nXSROYW1lKSB7CiAgICAgJGNvcmVEaXI9W0lPLlBhdGhdOjpHZXRGdWxsUGF0aCgoSm9pbi1QYXRoICRlbnY6UHJvZ3JhbUZpbGVzICJkb3RuZXRcc2hhcmVkXE1pY3Jvc29mdC5ORVRDb3JlLkFwcFwkUnVudGltZVZlcnNpb24iKSkKICAgICAkd3BmRGlyPVtJTy5QYXRoXTo6R2V0RnVsbFBhdGgoKEpvaW4tUGF0aCAkZW52OlByb2dyYW1GaWxlcyAiZG90bmV0XHNoYXJlZFxNaWNyb3NvZnQuV2luZG93c0Rlc2t0b3AuQXBwXCRSdW50aW1lVmVyc2lvbiIpKQotICAgICR3YW50ZWQ9QCgnY29yZWNsci5kbGwnLCdQcmVzZW50YXRpb25GcmFtZXdvcmsuZGxsJywnU3lzdGVtLlByaXZhdGUuV2luZG93cy5Db3JlLmRsbCcpCisgICAgJHdhbnRlZD1AKCdjb3JlY2xyLmRsbCcsJ1ByZXNlbnRhdGlvbkZyYW1ld29yay5kbGwnKQogICAgICRkZWFkbGluZT1bRGF0ZVRpbWVdOjpVdGNOb3cuQWRkU2Vjb25kcygxMCk7JG1vZHM9QCgpCi0gICAgZG97dHJ5eyRQcm9jZXNzLlJlZnJlc2goKTskbW9kcz1AKCRQcm9jZXNzLk1vZHVsZXN8V2hlcmUtT2JqZWN0eyRfLk1vZHVsZU5hbWUgLWluICR3YW50ZWR9KX1jYXRjaHt9O2lmKCRtb2RzLkNvdW50IC1lcSAzKXticmVha307U3RhcnQtU2xlZXAgLU1pbGxpc2Vjb25kcyAyMDB9d2hpbGUoW0RhdGVUaW1lXTo6VXRjTm93IC1sdCAkZGVhZGxpbmUpCi0gICAgaWYoJG1vZHMuQ291bnQgLW5lIDMpe3Rocm93ICJSdW50aW1lIG1vZHVsZSBjb3VudCBtaXNtYXRjaDogJCgkbW9kcy5Db3VudCkifQorICAgIGRve3RyeXskUHJvY2Vzcy5SZWZyZXNoKCk7JG1vZHM9QCgkUHJvY2Vzcy5Nb2R1bGVzfFdoZXJlLU9iamVjdHskXy5Nb2R1bGVOYW1lIC1pbiAkd2FudGVkfSl9Y2F0Y2h7fTtpZigkbW9kcy5Db3VudCAtZXEgMil7YnJlYWt9O1N0YXJ0LVNsZWVwIC1NaWxsaXNlY29uZHMgMjAwfXdoaWxlKFtEYXRlVGltZV06OlV0Y05vdyAtbHQgJGRlYWRsaW5lKQorICAgIGlmKCRtb2RzLkNvdW50IC1uZSAyKXt0aHJvdyAiUnVudGltZSBtb2R1bGUgY291bnQgbWlzbWF0Y2g6ICQoJG1vZHMuQ291bnQpIn0KICAgICAkbGluZXM9W0NvbGxlY3Rpb25zLkdlbmVyaWMuTGlzdFtzdHJpbmddXTo6bmV3KCk7JGxpbmVzLkFkZCgicHJvY2Vzc19pZD0kKCRQcm9jZXNzLklkKSIpCiAgICAgZm9yZWFjaCgkbSBpbiAkbW9kc3xTb3J0LU9iamVjdCBNb2R1bGVOYW1lKXskcGF0aD1bSU8uUGF0aF06OkdldEZ1bGxQYXRoKCRtLkZpbGVOYW1lKTskZXhwZWN0ZWQ9aWYoJG0uTW9kdWxlTmFtZSAtZXEgJ2NvcmVjbHIuZGxsJyl7JGNvcmVEaXJ9ZWxzZXskd3BmRGlyfTskbWF0Y2g9W1N0cmluZ106OkVxdWFscygoU3BsaXQtUGF0aCAtUGFyZW50ICRwYXRoKSwkZXhwZWN0ZWQsW1N0cmluZ0NvbXBhcmlzb25dOjpPcmRpbmFsSWdub3JlQ2FzZSk7aWYoLW5vdCRtYXRjaCl7dGhyb3cgIk1vZHVsZSBkaXJlY3RvcnkgbWlzbWF0Y2g6ICRwYXRoIn07JGxpbmVzLkFkZCgibW9kdWxlPSQoJG0uTW9kdWxlTmFtZSkiKTskbGluZXMuQWRkKCJwYXRoPSRwYXRoIik7JGxpbmVzLkFkZCgiZGlyZWN0b3J5X21hdGNoPXRydWUiKTskbGluZXMuQWRkKCJzaGEyNTY9JCgoR2V0LUZpbGVIYXNoIC1MaXRlcmFsUGF0aCAkcGF0aCAtQWxnb3JpdGhtIFNIQTI1NikuSGFzaC5Ub0xvd2VySW52YXJpYW50KCkpIil9CiAgICAgV3JpdGUtTGluZXMgKEpvaW4tUGF0aCAkcmVzdWx0cyAibW9kdWxlcy0kTmFtZS50eHQiKSAkbGluZXMuVG9BcnJheSgpCkBAIC0yNzgsOCArMjgzLDggQEAKICAgICAgICAoR2V0LVJlY2VpcHRWYWx1ZSAkcHJvYmVSZWNlaXB0ICdpbnRlZ3JpdHlSaWQnKSAtbmUgJzQwOTYnIC1vcgogICAgICAgIChUZXN0LVBhdGggLUxpdGVyYWxQYXRoICRtYXJrZXIpKXt0aHJvdyAnTG93IGRpcmVjdC13cml0ZSBkZW5pYWwgZ2F0ZSBmYWlsZWQuJ30KIAotICAgICRub25jZT1OZXctTm9uY2U7JHBheWxvYWQ9Sm9pbi1QYXRoICRwcm90ZWN0ZWQgJ3BheWxvYWQueGFtbCc7JHJlbmRlclJlY2VpcHQ9Sm9pbi1QYXRoICRwcm90ZWN0ZWQgJ3JlbmRlci50eHQnOyRjbWRQYXRoPVtJTy5QYXRoXTo6R2V0RnVsbFBhdGgoKEpvaW4tUGF0aCAkZW52OlN5c3RlbVJvb3QgJ1N5c3RlbTMyXGNtZC5leGUnKSkKLSAgICAmIChKb2luLVBhdGggJGhhcm5lc3MgJ21hcmtlcl9wcm9maWxlXHJlbmRlci1tYXJrZXItZml4dHVyZS5wczEnKSAtVGVtcGxhdGVQYXRoIChKb2luLVBhdGggJGhhcm5lc3MgJ21hcmtlcl9wcm9maWxlXGZpeHR1cmVzXHBheWxvYWQtc2VjdGlvbi1wcm9jZXNzLnhhbWwudGVtcGxhdGUnKSAtTWFya2VyUGF0aCAkbWFya2VyIC1Ob25jZSAkbm9uY2UgLU91dHB1dFBhdGggJHBheWxvYWQgLVJlY2VpcHRQYXRoICRyZW5kZXJSZWNlaXB0IC1BbGxvd2VkUm9vdCAkcHJvdGVjdGVkIC1DbWRQYXRoICRjbWRQYXRofE91dC1GaWxlIChKb2luLVBhdGggJHJlc3VsdHMgJ3JlbmRlci1jb25zb2xlLnR4dCcpIC1XaWR0aCAyNjAKKyAgICAkbm9uY2U9TmV3LU5vbmNlOyRwYXlsb2FkPUpvaW4tUGF0aCAkcHJvdGVjdGVkICdwYXlsb2FkLnhhbWwnOyRyZW5kZXJSZWNlaXB0PUpvaW4tUGF0aCAkcHJvdGVjdGVkICdyZW5kZXIudHh0JworICAgICYgKEpvaW4tUGF0aCAkaGFybmVzcyAnbWFya2VyX3Byb2ZpbGVccmVuZGVyLW1hcmtlci1maXh0dXJlLnBzMScpIC1UZW1wbGF0ZVBhdGggKEpvaW4tUGF0aCAkaGFybmVzcyAnbWFya2VyX3Byb2ZpbGVcZml4dHVyZXNccGF5bG9hZC1zZWN0aW9uLWZpbGUueGFtbC50ZW1wbGF0ZScpIC1NYXJrZXJQYXRoICRtYXJrZXIgLU5vbmNlICRub25jZSAtT3V0cHV0UGF0aCAkcGF5bG9hZCAtUmVjZWlwdFBhdGggJHJlbmRlclJlY2VpcHQgLUFsbG93ZWRSb290ICRwcm90ZWN0ZWR8T3V0LUZpbGUgKEpvaW4tUGF0aCAkcmVzdWx0cyAncmVuZGVyLWNvbnNvbGUudHh0JykgLVdpZHRoIDI2MAogICAgIGlmKCRMQVNURVhJVENPREUgLW5lIDApe3Rocm93ICdGaXh0dXJlIHJlbmRlciBmYWlsZWQuJ30KICAgICAkcGF5bG9hZEhhc2g9R2V0LVJlY2VpcHRWYWx1ZSAkcmVuZGVyUmVjZWlwdCAncGF5bG9hZF9zaGEyNTYnOyRwYXlsb2FkTGVuZ3RoPVtpbnRdKEdldC1SZWNlaXB0VmFsdWUgJHJlbmRlclJlY2VpcHQgJ3BheWxvYWRfbGVuZ3RoJykKICAgICBDb3B5LUl0ZW0gJHBheWxvYWQgKEpvaW4tUGF0aCAkcmVzdWx0cyAnZml4dHVyZS54YW1sJyk7Q29weS1JdGVtICRyZW5kZXJSZWNlaXB0IChKb2luLVBhdGggJHJlc3VsdHMgJ3JlbmRlci1yZWNlaXB0LnR4dCcpCkBAIC0zMDQsMTEgKzMwOSwxMSBAQAogICAgICAgIChHZXQtUmVjZWlwdFZhbHVlICR3cm9uZ1JlY2VpcHQgJ2V4cGVjdGVkUmVzdWx0JykgLW5lICd0cnVlJyAtb3IKICAgICAgICAoR2V0LVJlY2VpcHRWYWx1ZSAkd3JvbmdSZWNlaXB0ICdpbnRlZ3JpdHlSaWQnKSAtbmUgJzQwOTYnIC1vcgogICAgICAgIChHZXQtUmVjZWlwdFZhbHVlICR3cm9uZ1JlY2VpcHQgJ3NldENsaXBib2FyZERhdGEnKSAtbmUgJ3RydWUnKXt0aHJvdyAnV3JvbmctZm9ybWF0IHB1Ymxpc2hlciB0b2tlbi9jbGlwYm9hcmQgZ2F0ZSBmYWlsZWQuJ30KLSAgICAkd3JvbmdWaWN0aW09U3RhcnQtTWVkaXVtVmljdGltICRsYXVuY2hlciAkdmljdGltICdtZWRpdW0tdmljdGltLXdyb25nLWZvcm1hdCc7V3JpdGUtTW9kdWxlUmVjZWlwdCAkd3JvbmdWaWN0aW0gJ3dyb25nLWZvcm1hdCcKLSAgICAkd3JvbmdUcmFjZT1TdGFydC1DbWRUcmFjZSAnd3JvbmctZm9ybWF0Jzskd3JvbmdTZW5kPUludm9rZS1Ecml2ZXIgJGRyaXZlciAkd3JvbmdWaWN0aW0gJ3dyb25nLWZvcm1hdCc7U3RhcnQtU2xlZXAgLVNlY29uZHMgNQorICAgICR3cm9uZ1ZpY3RpbT1TdGFydC1NZWRpdW1WaWN0aW0gJGxhdW5jaGVyICR2aWN0aW0gJ21lZGl1bS12aWN0aW0td3JvbmctZm9ybWF0JworICAgICR3cm9uZ1NlbmQ9SW52b2tlLURyaXZlciAkZHJpdmVyICR3cm9uZ1ZpY3RpbSAnd3JvbmctZm9ybWF0JztTdGFydC1TbGVlcCAtU2Vjb25kcyA1CiAgICAgQXNzZXJ0LU1hcmtlckFic2VudCAkbWFya2VyICd3cm9uZy1mb3JtYXQtcG9zdCcKLSAgICBDb21wbGV0ZS1DbWRUcmFjZSAkd3JvbmdUcmFjZSAkd3JvbmdWaWN0aW0uSWQgJGNtZFBhdGggJHdyb25nU2VuZCAkZmFsc2UgJ3dyb25nLWZvcm1hdCcgJGxhdW5jaGVyCiAgICAgaWYoKEdldC1QYXlsb2FkUmVxdWVzdEV2ZW50cyAkc2VydmVyTG9nKS5Db3VudCAtbmUgMCl7dGhyb3cgJ1dyb25nIGZvcm1hdCBjYXVzZWQgcGF5bG9hZCByZXF1ZXN0Lid9CisgICAgV3JpdGUtTGluZXMgKEpvaW4tUGF0aCAkcmVzdWx0cyAnd3JvbmctZm9ybWF0LWF1dGhvcml0eS1jb250cm9sLnR4dCcpIEAoJ3ZlcmRpY3Q9V1JPTkdfRk9STUFUX0ZBSUxfQ0xPU0VEJywncGF5bG9hZF9yZXF1ZXN0X2NvdW50PTAnLCdtYXJrZXJfcHJlc2VudD1mYWxzZScsIm5vdF9iZWZvcmVfdXRjPSQoJHdyb25nU2VuZC5Ub1N0cmluZygnTycpKSIpCiAgICAgU3RvcC1Qcm9jZXNzQm91bmRlZCAkd3JvbmdWaWN0aW07Q2xlYXItUmVzZWFyY2hDbGlwYm9hcmQKIAogICAgICMgUG9zaXRpdmU6IHRoZSBzYW1lIGJ5dGVzIGFyZSByZXB1Ymxpc2hlZCBieSBMb3cgSUwgdW5kZXIgWGFtbFBhY2thZ2UuCkBAIC0zMjIsMjUgKzMyNywyMyBAQAogICAgICAgIChHZXQtUmVjZWlwdFZhbHVlICRwb3NpdGl2ZVJlY2VpcHQgJ3NldENsaXBib2FyZERhdGEnKSAtbmUgJ3RydWUnKXt0aHJvdyAnUG9zaXRpdmUgcHVibGlzaGVyIHRva2VuL2NsaXBib2FyZCBnYXRlIGZhaWxlZC4nfQogICAgIFdyaXRlLUxpbmVzIChKb2luLVBhdGggJHJlc3VsdHMgJ3Jhdy1vYmplY3QtZXF1aXZhbGVuY2UudHh0JykgQCgid3JvbmdfZm9ybWF0X3NoYTI1Nj0kcmF3SGFzaCIsInhhbWxwYWNrYWdlX3NoYTI1Nj0kcmF3SGFzaCIsJ3Jhd19ieXRlc19pZGVudGljYWw9dHJ1ZScpCiAgICAgQXNzZXJ0LU1hcmtlckFic2VudCAkbWFya2VyICdwb3NpdGl2ZS1wcmUnCi0gICAgJHBvc2l0aXZlVmljdGltPVN0YXJ0LU1lZGl1bVZpY3RpbSAkbGF1bmNoZXIgJHZpY3RpbSAnbWVkaXVtLXZpY3RpbS1wb3NpdGl2ZSc7V3JpdGUtTW9kdWxlUmVjZWlwdCAkcG9zaXRpdmVWaWN0aW0gJ3Bvc2l0aXZlJwotICAgICRwb3NpdGl2ZVRyYWNlPVN0YXJ0LUNtZFRyYWNlICdwb3NpdGl2ZSc7JHBvc2l0aXZlU2VuZD1JbnZva2UtRHJpdmVyICRkcml2ZXIgJHBvc2l0aXZlVmljdGltICdwb3NpdGl2ZScKKyAgICAkcG9zaXRpdmVWaWN0aW09U3RhcnQtTWVkaXVtVmljdGltICRsYXVuY2hlciAkdmljdGltICdtZWRpdW0tdmljdGltLXBvc2l0aXZlJworICAgICRwb3NpdGl2ZVNlbmQ9SW52b2tlLURyaXZlciAkZHJpdmVyICRwb3NpdGl2ZVZpY3RpbSAncG9zaXRpdmUnCiAgICAgQXNzZXJ0LUV4YWN0TWFya2VyICRtYXJrZXIgJG5vbmNlICRwb3NpdGl2ZVNlbmQKKyAgICBXcml0ZS1Nb2R1bGVSZWNlaXB0ICRwb3NpdGl2ZVZpY3RpbSAncG9zaXRpdmUnCiAgICAgJGV2ZW50cz1HZXQtUGF5bG9hZFJlcXVlc3RFdmVudHMgJHNlcnZlckxvZwogICAgIGlmKCRldmVudHMuQ291bnQgLW5lIDEpe3Rocm93ICJFeHBlY3RlZCBvbmUgcGF5bG9hZCByZXF1ZXN0OyBmb3VuZCAkKCRldmVudHMuQ291bnQpLiJ9CiAgICAgJGV2ZW50PSRldmVudHNbMF0KICAgICBpZigkZXZlbnQuVGltZSAtbHQgJHBvc2l0aXZlU2VuZCAtb3IgJGV2ZW50LlN0YXR1cyAtbmUgJzIwMCcgLW9yICRldmVudC5IYXNoIC1uZSAkcGF5bG9hZEhhc2ggLW9yICRldmVudC5MZW5ndGggLW5lICRwYXlsb2FkTGVuZ3RoKXt0aHJvdyAnUGF5bG9hZCByZXF1ZXN0IGJpbmRpbmcgZmFpbGVkLid9CiAgICAgV3JpdGUtTGluZXMgKEpvaW4tUGF0aCAkcmVzdWx0cyAnc2VydmVyLXBvc2l0aXZlLWFzc2VydGlvbi50eHQnKSBAKCd2ZXJkaWN0PUVYQUNUX0xPT1BCQUNLX1BBWUxPQURfUEFTUycsInJlcXVlc3RfdXRjPSQoJGV2ZW50LlRpbWUuVG9TdHJpbmcoJ08nKSkiLCdwYXRoPS9wYXlsb2FkLnhhbWwnLCdzdGF0dXM9MjAwJywnY29udGVudF90eXBlPWFwcGxpY2F0aW9uL3hhbWwreG1sJywic2hhMjU2PSQoJGV2ZW50Lkhhc2gpIiwibGVuZ3RoPSQoJGV2ZW50Lkxlbmd0aCkiLCJub3RfYmVmb3JlX3V0Yz0kKCRwb3NpdGl2ZVNlbmQuVG9TdHJpbmcoJ08nKSkiKQotICAgIENvbXBsZXRlLUNtZFRyYWNlICRwb3NpdGl2ZVRyYWNlICRwb3NpdGl2ZVZpY3RpbS5JZCAkY21kUGF0aCAkcG9zaXRpdmVTZW5kICR0cnVlICdwb3NpdGl2ZScgJGxhdW5jaGVyCiAgICAgU3RvcC1Qcm9jZXNzQm91bmRlZCAkcG9zaXRpdmVWaWN0aW07Q2xlYXItUmVzZWFyY2hDbGlwYm9hcmQKIAotICAgICRjbWRTaWc9R2V0LUF1dGhlbnRpY29kZVNpZ25hdHVyZSAtTGl0ZXJhbFBhdGggJGNtZFBhdGgKLSAgICBXcml0ZS1MaW5lcyAoSm9pbi1QYXRoICRyZXN1bHRzICdjbWQtcHJvZHVjdC1yZWNlaXB0LnR4dCcpIEAoInBhdGg9JGNtZFBhdGgiLCJzaGEyNTY9JCgoR2V0LUZpbGVIYXNoICRjbWRQYXRoIC1BbGdvcml0aG0gU0hBMjU2KS5IYXNoLlRvTG93ZXJJbnZhcmlhbnQoKSkiLCJjb21wYW55PSQoKEdldC1JdGVtICRjbWRQYXRoKS5WZXJzaW9uSW5mby5Db21wYW55TmFtZSkiLCJzaWduYXR1cmVfc3RhdHVzPSQoJGNtZFNpZy5TdGF0dXMpIiwic2lnbmVyX3N1YmplY3Q9JCgkY21kU2lnLlNpZ25lckNlcnRpZmljYXRlLlN1YmplY3QpIikKICAgICBXcml0ZS1MaW5lcyAoSm9pbi1QYXRoICRyZXN1bHRzICdWRVJESUNULnR4dCcpIEAoCi0gICAgICAgICdWRVJESUNUPUxPV19UT19NRURJVU1fU1RPQ0tfV1BGX0NMSVBCT0FSRF9SQ0VfUEFTUycsInJ1bnRpbWU9JFJ1bnRpbWVWZXJzaW9uIiwidGFyZ2V0X2ZyYW1ld29yaz0kVGFyZ2V0RnJhbWV3b3JrIiwKKyAgICAgICAgJ1ZFUkRJQ1Q9TE9XX1RPX01FRElVTV9TVE9DS19XUEZfQ0xJUEJPQVJEX1BST1RFQ1RFRF9XUklURV9QQVNTJywicnVudGltZT0kUnVudGltZVZlcnNpb24iLCJ0YXJnZXRfZnJhbWV3b3JrPSRUYXJnZXRGcmFtZXdvcmsiLAogICAgICAgICAncHJvZHVjZXJfaW50ZWdyaXR5PUxvdycsJ3Byb2R1Y2VyX2VuYWJsZWRfcHJpdmlsZWdlcz1TZUNoYW5nZU5vdGlmeVByaXZpbGVnZScsJ3Byb2R1Y2VyX2Rhbmdlcm91c19wcml2aWxlZ2VzX2Rpc2FibGVkPXRydWUnLCdwcm9kdWNlcl9kaXJlY3RfbWVkaXVtX3dyaXRlPWRlbmllZCcsCiAgICAgICAgICd2aWN0aW1faW50ZWdyaXR5PU1lZGl1bScsJ3ZpY3RpbV9lbmFibGVkX3ByaXZpbGVnZXM9U2VDaGFuZ2VOb3RpZnlQcml2aWxlZ2UnLCd2aWN0aW1fZGFuZ2Vyb3VzX3ByaXZpbGVnZXNfZGlzYWJsZWQ9dHJ1ZScsJ3ZpY3RpbV9zdG9ja19yaWNodGV4dGJveD10cnVlJywnaW5wdXQ9Z2VudWluZV9jdHJsX3YnLAotICAgICAgICAnd3JvbmdfZm9ybWF0X3NhbWVfYnl0ZXM9ZmFpbF9jbG9zZWQnLCd4YW1scGFja2FnZT1wYXlsb2FkX2ZldGNoX2FuZF9wcm9jZXNzX2V4ZWN1dGlvbicsCi0gICAgICAgICdjaGlsZF9wcm9jZXNzPU1pY3Jvc29mdF9TeXN0ZW0zMl9jbWQuZXhlJywnY2hpbGRfaW50ZWdyaXR5PU1lZGl1bScsJ2NoaWxkX2VuYWJsZWRfcHJpdmlsZWdlcz1TZUNoYW5nZU5vdGlmeVByaXZpbGVnZScsJ2NoaWxkX2Rhbmdlcm91c19wcml2aWxlZ2VzX2Rpc2FibGVkPXRydWUnLCdtYXJrZXJfZXhhY3Rfbm9uY2U9dHJ1ZScpCisgICAgICAgICd3cm9uZ19mb3JtYXRfc2FtZV9ieXRlcz1mYWlsX2Nsb3NlZCcsJ3hhbWxwYWNrYWdlPWV4YWN0X3BheWxvYWRfZmV0Y2hfYW5kX3Byb3RlY3RlZF93cml0ZScsCisgICAgICAgICdwcm90ZWN0ZWRfcG9zdGNvbmRpdGlvbj1leGFjdF9ub25jZV9maWxlX2NyZWF0ZWRfdW5kZXJfTWVkaXVtX01hbmRhdG9yeV9MYWJlbCcsJ21hcmtlcl9leGFjdF9ub25jZT10cnVlJykKIAogICAgIEdldC1DaGlsZEl0ZW0gLUxpdGVyYWxQYXRoICRyZXN1bHRzIC1GaWxlIC1SZWN1cnNlfFdoZXJlLU9iamVjdCBOYW1lIC1uZSAnU0hBMjU2U1VNUy50eHQnfFNvcnQtT2JqZWN0IEZ1bGxOYW1lfEZvckVhY2gtT2JqZWN0eyIkKChHZXQtRmlsZUhhc2ggJF8uRnVsbE5hbWUgLUFsZ29yaXRobSBTSEEyNTYpLkhhc2guVG9Mb3dlckludmFyaWFudCgpKSAgJChbSU8uUGF0aF06OkdldFJlbGF0aXZlUGF0aCgkcmVzdWx0cywkXy5GdWxsTmFtZSkuUmVwbGFjZSgnXCcsJy8nKSkifXxTZXQtQ29udGVudCAoSm9pbi1QYXRoICRyZXN1bHRzICdTSEEyNTZTVU1TLnR4dCcpIC1FbmNvZGluZyBhc2NpaQogfQo='))
+          $patchHash = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($patchHash -ne 'f46be5b9b5a24001c502c8012c80b7059353d5b7217ea035767bcd62c01d367c') { throw "v7 patch hash mismatch: $patchHash" }
+          Push-Location $integrityRoot
+          try {
+            & git.exe apply --no-index --whitespace=nowarn $patchPath
+            if ($LASTEXITCODE -ne 0) { throw "v7 patch apply failed: $LASTEXITCODE" }
+          }
+          finally { Pop-Location }
+          $normalizedScript = [IO.File]::ReadAllText($script).Replace("`r`n","`n")
+          [IO.File]::WriteAllText($script,$normalizedScript,[Text.UTF8Encoding]::new($false))
+          $v7ScriptHash = (Get-FileHash -LiteralPath $script -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($v7ScriptHash -ne '3d78cbea34d0ee4d026ff1f848bc6bc1b66fbcd20b7daf229e8dda968e9d1a25') { throw "v7 patched runner hash mismatch: $v7ScriptHash" }
+          $oldMarkerCheck = "if(-not `$actual.AsSpan().SequenceEqual(`$expected)){ throw 'Marker bytes differ from nonce.' }"
+          $newMarkerCheck = "if(`$actual.Length -ne `$expected.Length -or (Get-Sha256Hex `$actual) -ne (Get-Sha256Hex `$expected)){ throw 'Marker bytes differ from nonce.' }"
+          $scriptText = [IO.File]::ReadAllText($script)
+          $oldMarkerCheckCount = ([regex]::Matches($scriptText,[regex]::Escape($oldMarkerCheck))).Count
+          if ($oldMarkerCheckCount -ne 1) { throw "v8 marker-check replacement count mismatch: $oldMarkerCheckCount" }
+          $scriptText = $scriptText.Replace($oldMarkerCheck,$newMarkerCheck)
+          [IO.File]::WriteAllText($script,$scriptText,[Text.UTF8Encoding]::new($false))
+          $expectedScriptHash = 'cf680e341a6f1a1e5d0728d90b313be1ae1818ec430d01987f850a7a24b1bfb7'
+          $patchedScriptHash = (Get-FileHash -LiteralPath $script -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($patchedScriptHash -ne $expectedScriptHash) { throw "v8 patched runner hash mismatch: $patchedScriptHash" }
+          @(
+            'schema=zdb.wpf.v5-to-v8-protected-write-patch.v1'
+            "base_sha256=$baseScriptHash"
+            "v7_patch_sha256=$patchHash"
+            "v7_sha256=$v7ScriptHash"
+            "v8_sha256=$patchedScriptHash"
+            'compatibility_fix=PowerShell_byte_array_exact_hash_and_length_comparison'
+            'postcondition=exact_nonce_file_under_medium_mandatory_label'
+            'fixture=payload-section-file.xaml.template'
+            'clipboard_cleanup=bounded'
+          ) | Set-Content (Join-Path $integrityRoot 'V8_PATCH_RECEIPT.txt')
+          $actualScriptHash = (Get-FileHash -LiteralPath $script -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualScriptHash -ne $expectedScriptHash) { throw "runner script hash mismatch: $actualScriptHash" }
+          $tokens = $null; $parseErrors = $null
+          [Management.Automation.Language.Parser]::ParseFile($script,[ref]$tokens,[ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count -ne 0) {
+            $parseErrors | Format-List * | Out-String | Write-Error
+            throw "runner parse failed: $($parseErrors.Count)"
+          }
+          $results = Join-Path $env:RUNNER_TEMP "wpf-low-results-$env:TARGET"
+          $stdout = Join-Path $env:RUNNER_TEMP "wpf-low-$env:TARGET.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "wpf-low-$env:TARGET.stderr.log"
+          $arguments = @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$script,
+            '-TargetFramework',$env:TFM,
+            '-SdkVersion',$env:SDK_VERSION,
+            '-RuntimeVersion',$env:RUNTIME_VERSION,
+            '-PresentationVersion',$env:PRESENTATION_VERSION,
+            '-HarnessRoot',$harness,
+            '-ResultsPath',$results,
+            '-Port',$env:PORT
+          )
+          $process = Start-Process -FilePath pwsh.exe -ArgumentList $arguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          "EXIT_CODE=$($process.ExitCode)" | Set-Content (Join-Path $env:RUNNER_TEMP "wpf-low-$env:TARGET.exit.txt")
+          if ($process.ExitCode -ne 0) { throw "low-integrity validation failed: $($process.ExitCode)" }
+
+      - name: Stage private evidence
+        if: always()
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          SDK_VERSION: ${{ matrix.sdk }}
+          RUNTIME_VERSION: ${{ matrix.runtime }}
+          EXECUTION_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $privateRoot = Join-Path $env:RUNNER_TEMP 'wpf-low-private'
+          $mainRoot = Join-Path $privateRoot 'main\wpf-cleanroom-payload-v2'
+          $integrityRoot = Join-Path $privateRoot 'integrity\wpf-integrity-tools-payload-v5'
+          $stage = Join-Path $env:RUNNER_TEMP "wpf-low-evidence-$env:TARGET"
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $results = Join-Path $env:RUNNER_TEMP "wpf-low-results-$env:TARGET"
+          if (Test-Path -LiteralPath $results) { Copy-Item -LiteralPath $results -Destination (Join-Path $stage 'results') -Recurse -Force }
+          else { 'RESULTS_MISSING' | Set-Content (Join-Path $stage 'results-missing.txt') }
+          foreach ($item in @(
+            (Join-Path $integrityRoot 'PAYLOAD_PROVENANCE.json'),
+            (Join-Path $integrityRoot 'MANIFEST.json'),
+            (Join-Path $integrityRoot 'run-wpf-low-integrity.ps1'),
+            (Join-Path $integrityRoot 'IntegrityLauncher\Program.cs'),
+            (Join-Path $integrityRoot 'IntegrityLauncher\IntegrityLauncher.csproj'),
+            (Join-Path $integrityRoot 'NativeLowWriteProbe.c'),
+            (Join-Path $integrityRoot 'NativeClipboardPublisher.c'),
+            (Join-Path $integrityRoot 'V8_PATCH_RECEIPT.txt'),
+            (Join-Path $mainRoot 'PAYLOAD_PROVENANCE.json'),
+            (Join-Path $mainRoot 'MANIFEST.json'),
+            (Join-Path $privateRoot 'main\DECRYPTION_RECEIPT.txt'),
+            (Join-Path $privateRoot 'integrity\DECRYPTION_RECEIPT.txt'))){
+            if (Test-Path -LiteralPath $item) { Copy-Item -LiteralPath $item -Destination $stage -Force }
+          }
+          foreach ($suffix in @('stdout.log','stderr.log','exit.txt')) {
+            $path = Join-Path $env:RUNNER_TEMP "wpf-low-$env:TARGET.$suffix"
+            if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $stage -Force }
+          }
+          @(
+            "TARGET=$env:TARGET"
+            "SDK_VERSION=$env:SDK_VERSION"
+            "RUNTIME_VERSION=$env:RUNTIME_VERSION"
+            "EXECUTION_OUTCOME=$env:EXECUTION_OUTCOME"
+            "GITHUB_RUN_ID=$env:GITHUB_RUN_ID"
+            "GITHUB_RUN_ATTEMPT=$env:GITHUB_RUN_ATTEMPT"
+            "GITHUB_SHA=$env:GITHUB_SHA"
+            "RUNNER_OS=$env:RUNNER_OS"
+            "RUNNER_ARCH=$env:RUNNER_ARCH"
+            "UTC=$([DateTime]::UtcNow.ToString('o'))"
+          ) | Set-Content (Join-Path $stage 'RUN_RECEIPT.txt')
+          Get-ChildItem -LiteralPath $stage -File -Recurse |
+            Where-Object Name -ne 'SHA256SUMS.txt' |
+            Sort-Object FullName |
+            ForEach-Object { "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetRelativePath($stage,$_.FullName).Replace('\','/'))" } |
+            Set-Content (Join-Path $stage 'SHA256SUMS.txt') -Encoding ascii
+
+      - name: Remove decrypted private payloads
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'wpf-low-private') -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Encrypt evidence before upload
+        if: always()
+        shell: pwsh
+        env:
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP "wpf-low-evidence-$env:TARGET"
+          if (-not (Test-Path -LiteralPath $stage)) { New-Item -ItemType Directory -Force -Path $stage | Out-Null; 'STAGE_MISSING' | Set-Content (Join-Path $stage 'status.txt') }
+          $zipPath = Join-Path $env:RUNNER_TEMP "wpf-low-evidence-$env:TARGET.zip"
+          Compress-Archive -LiteralPath $stage -DestinationPath $zipPath -Force
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+          $plainHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant()
+          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
+          $iv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.IV = $iv
+            $encryptor = $aes.CreateEncryptor()
+            try { $cipher = $encryptor.TransformFinalBlock($plain,0,$plain.Length) }
+            finally { $encryptor.Dispose() }
+          }
+          finally { $aes.Dispose() }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'evidence.enc'),$cipher)
+          [Convert]::ToBase64String($iv) | Set-Content (Join-Path $PWD 'evidence.iv.b64')
+          $plainHash | Set-Content (Join-Path $PWD 'evidence.plain.sha256')
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.cipher.sha256')
+          Remove-Item -LiteralPath $stage -Recurse -Force
+          Remove-Item -LiteralPath $zipPath -Force
+
+      - name: Upload encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpf-low-v8-encrypted-${{ matrix.target }}
+          path: |
+            evidence.enc
+            evidence.iv.b64
+            evidence.plain.sha256
+            evidence.cipher.sha256
+          if-no-files-found: error
