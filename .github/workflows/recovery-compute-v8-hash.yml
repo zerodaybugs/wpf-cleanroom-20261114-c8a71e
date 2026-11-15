@@ -1,0 +1,57 @@
+name: Recovery Compute V8 Runner Hash
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decrypt v5, apply retained v7 patch, and compute compatibility-fixed hash
+        shell: bash
+        env:
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/v8-hash"
+          rm -rf "$work"; mkdir -p "$work/root"
+          keyhex=$(printf '%s' "$PAYLOAD_KEY_B64" | base64 -d | xxd -p -c 256)
+          cipher=$(base64 -d < wpf-integrity-tools-payload-v5-cipher.b64)
+          actual_cipher=$(printf '%s' "$cipher" | sha256sum | awk '{print $1}')
+          expected_cipher=$(tr -d '\r\n ' < integrity-tools-v5.cipher.sha256)
+          test "$actual_cipher" = "$expected_cipher"
+          base64 -d < wpf-integrity-tools-payload-v5-cipher.b64 > "$work/payload.enc"
+          ivhex=$(base64 -d < integrity-tools-v5.iv.b64 | xxd -p -c 256)
+          openssl enc -d -aes-256-cbc -K "$keyhex" -iv "$ivhex" -in "$work/payload.enc" -out "$work/payload.zip"
+          test "$(sha256sum "$work/payload.zip" | awk '{print $1}')" = "$(tr -d '\r\n ' < integrity-tools-v5.plain.sha256)"
+          unzip -q "$work/payload.zip" -d "$work/root"
+          root="$work/root/wpf-integrity-tools-payload-v5"
+          script="$root/run-wpf-low-integrity.ps1"
+          test "$(sha256sum "$script" | awk '{print $1}')" = '378462ac2a2ce8596515697e1403f52798aa388973e750ca0d640761d27f26d7'
+          python3 - <<'PY'
+          import re,base64,pathlib
+          wf=pathlib.Path('.github/workflows/encrypted-wpf-low-integrity-v7write-lf.yml').read_text()
+          b64=re.search(r"FromBase64String\('([^']+)'\)",wf).group(1)
+          pathlib.Path('/tmp/v7.diff').write_bytes(base64.b64decode(b64))
+          PY
+          (cd "$root" && git apply --no-index --whitespace=nowarn /tmp/v7.diff)
+          python3 - "$script" <<'PY'
+          import pathlib,sys,hashlib
+          p=pathlib.Path(sys.argv[1])
+          s=p.read_text(encoding='utf-8').replace('\r\n','\n')
+          p.write_text(s,encoding='utf-8',newline='\n')
+          h=hashlib.sha256(p.read_bytes()).hexdigest()
+          assert h=='3d78cbea34d0ee4d026ff1f848bc6bc1b66fbcd20b7daf229e8dda968e9d1a25',h
+          old="if(-not $actual.AsSpan().SequenceEqual($expected)){ throw 'Marker bytes differ from nonce.' }"
+          new="if($actual.Length -ne $expected.Length -or (Get-Sha256Hex $actual) -ne (Get-Sha256Hex $expected)){ throw 'Marker bytes differ from nonce.' }"
+          assert s.count(old)==1,s.count(old)
+          s=s.replace(old,new)
+          p.write_text(s,encoding='utf-8',newline='\n')
+          print('V8_SCRIPT_SHA256='+hashlib.sha256(p.read_bytes()).hexdigest())
+          print('OLD_OCCURRENCES='+str(s.count(old)))
+          print('NEW_OCCURRENCES='+str(s.count(new)))
+          PY
