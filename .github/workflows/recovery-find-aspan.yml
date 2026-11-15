@@ -1,0 +1,40 @@
+name: Recovery Find AsSpan Failure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decrypt latest failed evidence and locate incompatible call
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          REPO: ${{ github.repository }}
+          RUN_ID: '43652838115'
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/aspan"
+          rm -rf "$work"; mkdir -p "$work"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/artifacts?per_page=100" > "$work/a.json"
+          keyhex=$(printf '%s' "$PAYLOAD_KEY_B64" | base64 -d | xxd -p -c 256)
+          id=$(jq -r '.artifacts[] | select(.name=="wpf-low-encrypted-net10") | .id' "$work/a.json")
+          url=$(jq -r '.artifacts[] | select(.name=="wpf-low-encrypted-net10") | .archive_download_url' "$work/a.json")
+          test -n "$id"; test -n "$url"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$url" -o "$work/outer.zip"
+          mkdir "$work/outer" "$work/plain"
+          unzip -q "$work/outer.zip" -d "$work/outer"
+          ivhex=$(base64 -d < "$work/outer/evidence.iv.b64" | xxd -p -c 256)
+          openssl enc -d -aes-256-cbc -K "$keyhex" -iv "$ivhex" -in "$work/outer/evidence.enc" -out "$work/plain.zip"
+          unzip -q "$work/plain.zip" -d "$work/plain"
+          echo '===== ASPAN MATCHES ====='
+          grep -Rni -C 8 -- 'AsSpan\|SequenceEqual' "$work/plain" || true
+          echo '===== ASSERT EXACT MARKER ====='
+          grep -Rni -A 35 -B 5 -- 'function Assert-ExactMarker' "$work/plain" || true
