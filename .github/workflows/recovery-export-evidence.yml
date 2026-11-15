@@ -172,7 +172,18 @@ jobs:
           test -d "$export_root/evidence/base-current-matrix/wpf-encrypted-net11-r1"
           test -d "$export_root/evidence/authority-v8/wpf-low-v8-encrypted-net10"
           test -d "$export_root/evidence/authority-v8/wpf-low-v8-encrypted-net11"
-          grep -Rqx 'VERDICT=LOW_TO_MEDIUM_STOCK_WPF_CLIPBOARD_PROTECTED_WRITE_PASS' "$export_root/evidence/authority-v8"/*/*/results/VERDICT.txt
+          python3 - "$export_root/evidence/authority-v8" <<'PY'
+          from pathlib import Path
+          import sys
+          root=Path(sys.argv[1])
+          files=sorted(root.glob('*/*/results/VERDICT.txt'))
+          assert len(files)==2, [str(p) for p in files]
+          expected='VERDICT=LOW_TO_MEDIUM_STOCK_WPF_CLIPBOARD_PROTECTED_WRITE_PASS'
+          for path in files:
+              lines={line.strip() for line in path.read_text(encoding='utf-8-sig').splitlines()}
+              assert expected in lines, (str(path), sorted(lines))
+              print('AUTHORITY_VERDICT_PASS='+str(path.relative_to(root)))
+          PY
 
           cat > "$export_root/EXPORT_RECEIPT.txt" <<EOF
           schema=zdb.wpf.recovery-export.v1
